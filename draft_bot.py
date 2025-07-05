@@ -14,6 +14,7 @@ from discord import TextStyle
 load_dotenv()
 EMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -35,6 +36,16 @@ if not os.path.exists(DRAFTS_FILE):
 def load_drafts():
     with open(DRAFTS_FILE, "r") as f:
         return json.load(f)
+
+async def has_role(member: discord.Member, roles):
+    """Check if a member has at least one of the given roles."""
+    role_ids={r.id for r in member.roles}
+    for role in roles:
+        if isinstance(role, int) and role in role_ids:
+            return True
+        if isinstance(role, str) and any(role==r.name for r in member.roles):
+            return True
+    return False
 
 # ✅ NOW OUTSIDE OF load_drafts
 async def move_and_delete_voice_channels(guild, draft):
@@ -291,18 +302,26 @@ class PlayerCashTagForm(discord.ui.Modal, title="Enter Your Cash App Tag"):
 
 
 class PaymentControlView(discord.ui.View):
-    def __init__(self, channel_id):
+    def __init__(self, channel_id, middleman_id):
         super().__init__(timeout=None)
         self.channel_id = channel_id
+        self.middleman_id = middleman_id
+
+    @discord.ui.button(label="✅ Confirm All Payments Received", style=discord.ButtonStyle.green)
+    async def confirm_payments(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.middleman_id:
+            await interaction.response.send_message("Only the Middleman can confirm payments.", ephemeral=True)
+            return
+        await interaction.response.send_message("✅ Payments confirmed. Starting draft...", ephemeral=True)
+        await auto_start_draft(interaction.guild, interaction.channel)
 
     @discord.ui.button(label="Start Draft Manually", style=discord.ButtonStyle.red)
     async def manual_start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await has_role(interaction.user, ["Draft Admin", "Middleman"]):
+        if interaction.user.id != self.middleman_id and not await has_role(interaction.user, ["Draft Admin"]):
             await interaction.response.send_message("You don’t have permission to start the draft.", ephemeral=True)
             return
-
-        await interaction.response.send_message("✅ Starting draft manually...", ephemeral=True)
-        await auto_start_draft(interaction.channel)
+        await interaction.response.send_message("⏩ Starting draft manually...", ephemeral=True)
+        await auto_start_draft(interaction.guild, interaction.channel)
 
 
 
@@ -420,7 +439,7 @@ async def send_payment_instructions(channel):
     embed.set_footer(text="Once all payments are confirmed, the draft will begin.")
 
     # Manual Start Button
-    view = PaymentControlView(channel.id)
+    view = PaymentControlView(channel.id, draft.get("middleman_id"))
     await channel.send(embed=embed, view=view)
 
 
@@ -468,55 +487,6 @@ class GoToDraftButton(discord.ui.View):
 
 
 
-class MiddleManButton(discord.ui.View):
-    def __init__(self, channel_id, role_id):
-        super().__init__(timeout=None)
-        self.channel_id = str(channel_id)
-        self.role_id = role_id
-        self.middleman = None
-
-    @discord.ui.button(label="✅ I'm the Middle Man", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.role_id not in [role.id for role in interaction.user.roles]:
-            await interaction.response.send_message("❌ Only a Middle Man can click this.", ephemeral=True)
-            return
-
-        self.middleman = interaction.user
-        await interaction.channel.set_permissions(self.middleman, send_messages=True)
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content=f"✅ Middle Man Selected: {interaction.user.mention}", view=self)
-        await interaction.response.send_message("Thank you! Now send proof of payments.", ephemeral=True)
-
-        # Proceed with the draft start here
-        await send_payment_confirmation(interaction.channel, interaction.user)
-
-async def send_payment_confirmation(channel, middleman):
-    embed = discord.Embed(
-        title="💸 Send Payments",
-        description=f"All participants must now send their payments to {middleman.mention}.\n\nOnce all payments are confirmed, the Middle Man should confirm below.",
-        color=discord.Color.gold()
-    )
-    view = ConfirmPaymentButton(middleman.id)
-    await channel.send(embed=embed, view=view)
-
-
-class ConfirmPaymentButton(discord.ui.View):
-    def __init__(self, middleman_id):
-        super().__init__(timeout=None)
-        self.middleman_id = middleman_id
-
-    @discord.ui.button(label="✅ Confirm All Payments Received", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.middleman_id:
-            await interaction.response.send_message("❌ Only the selected Middle Man can confirm this.", ephemeral=True)
-            return
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content="✅ All payments received. Starting draft...", view=self)
-        await send_actual_draft_start(interaction.channel)
-        await send_pick_options(interaction.channel)
 
     
 class DraftQueueView(discord.ui.View):
@@ -615,7 +585,8 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
         submitted_tag = self.cash_tag.value.strip()
         data = load_drafts()
         draft = data.get(str(self.channel_id), {})
-        draft["middleman_cash_tag"] = submitted_tag
+        draft["middleman_cashapp"] = submitted_tag
+        draft["middleman_id"] = interaction.user.id
         save_drafts(data)
 
         await interaction.response.send_message(
@@ -628,20 +599,8 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
             return
 
         amount = draft.get("entry_amount", 0)
-        cash_tag_display = f"${submitted_tag}"
-
-        embed = discord.Embed(
-            title="💵 Payment Phase",
-            description=(
-                f"Please send **${amount}** to the middleman at `{cash_tag_display}`.\n\n"
-                "Each player must submit payment to continue."
-            ),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text="Use Cash App and make sure to send the correct amount.")
-
-        view = ManualStartView(channel_id=self.channel_id)
-        await channel.send(embed=embed, view=view)
+        if channel:
+            await send_payment_instructions(channel)
 
 
 
@@ -1237,20 +1196,14 @@ def check_cashapp_emails():
                             continue  # Skip this email, no subject
 
                         subject_header = msg.get("Subject")
-                        if subject_header is None:
-                            continue  # Skip if there's no subject
-
-                        raw_subject = msg.get("Subject")
-                        if raw_subject is None:
-                            continue  # skip if subject is missing
-
-                        subject, encoding = decode_header(raw_subject)[0]
-                        if isinstance(subject, bytes):
-                            subject = subject.decode(encoding if encoding else "utf-8")
-
-                        if isinstance(subject, bytes):
-                            subject = subject.decode(encoding if encoding else "utf-8")
-
+                        if not subject_header:
+                            continue
+                        subject = ""
+                        for part, enc in decode_header(subject_header):
+                            if isinstance(part, bytes):
+                                subject += part.decode(enc or "utf-8", errors="ignore")
+                            else:
+                                subject += part
                         print(f"📩 New email: {subject}")
 
                         # Check each pending payment for matching cash tag
@@ -1284,10 +1237,12 @@ def check_cashapp_emails():
 threading.Thread(target=check_cashapp_emails, daemon=True).start()
 
 
-
 @bot.event
 async def on_ready():
     await tree.sync()
     print(f"✅ Logged in as {bot.user.name}")
 
-bot.run("MTM3NzA3MjE4Njk2MzAwNTQ0MA.GCPWMK.pSCzixxkoDWig9VoGq4pVkZTyZYF0oCoSJ1mRQ")
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
+    bot.run(BOT_TOKEN)
