@@ -405,9 +405,7 @@ async def send_middleman_selection(channel):
     if not draft:
         return
 
-    role_id = draft.get("middleman_role_id")
-    if not role_id:
-        return
+    role_id = draft.get("middleman_role_id", MIDDLEMAN_ROLE_ID)
 
     embed = discord.Embed(
         title="✅ Middle Man Selected: <#{}>".format(channel.id),
@@ -650,8 +648,9 @@ async def createdraft(
         "voice_channels": {},
         "team_roles": {},
         "available": [],
-        "pick_turn": "team1"
-}
+        "pick_turn": "team1",
+        "middleman_role_id": MIDDLEMAN_ROLE_ID
+    }
 
 
 
